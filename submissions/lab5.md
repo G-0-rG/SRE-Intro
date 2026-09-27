@@ -6,35 +6,52 @@
 
 Created `.github/workflows/ci.yml`: triggers on push to `main`, logs into `ghcr.io` with `secrets.GITHUB_TOKEN`, then builds and pushes all 3 service images tagged with `${{ github.sha }}`. Image owner is lower-cased at runtime (`${GITHUB_REPOSITORY_OWNER,,}`) since ghcr.io rejects mixed-case paths and the GitHub username (`G-0-rG`) isn't already lowercase.
 
-Sanity-checked the same build steps locally (mirrors what CI's `docker build` will do) before trusting the workflow:
-```bash
-docker build -q -t quickticket-gateway:ci-test ./app/gateway
-docker build -q -t quickticket-events:ci-test ./app/events
-docker build -q -t quickticket-payments:ci-test ./app/payments
-```
-All three built cleanly.
+**GitHub Actions run:** https://github.com/G-0-rG/SRE-Intro/actions/runs/36319685709 — green, 57s.
 
-**Not yet done — needs an actual push to `main` on GitHub:**
-- Link to the GitHub Actions run
-- `gh api user/packages?package_type=container` output (5.2)
+```bash
+gh run list --repo G-0-rG/SRE-Intro --limit 3
+```
+```
+completed  success  Merge branch 'main' of https://github.com/G-0-rG/SRE-Intro   CI  main  push  36320471678  44s
+completed  success  Merge branch 'feature/lab5'                                  CI  main  push  36319685709  57s
+```
+
+### 5.2 — Images pushed
+
+`gh api user/packages` needs a `read:packages`-scoped token, which the local `gh auth` session doesn't have. Verified the push a different way — straight from the CI job log, and by pulling the images (logged out of `ghcr.io` first, so this proves they're really there, not cached):
+
+```bash
+gh run view --repo G-0-rG/SRE-Intro --job=108620993205 --log | grep digest
+```
+```
+66e439f32b9ec087ec3c5c36d3cc2a81ed8cb299: digest: sha256:4f0b555092c107a3a7cea02785e33625a3c381de33f83568c37ac489dae34815 size: 2199   (gateway)
+66e439f32b9ec087ec3c5c36d3cc2a81ed8cb299: digest: sha256:146fc3bf691383bed56e2c4175ea969e79db238832838334d7dcc826e7fd5e88 size: 2200   (events)
+66e439f32b9ec087ec3c5c36d3cc2a81ed8cb299: digest: sha256:5f40aa8e81288a5fe5880aa9b368614f0b46c4708a0167ef9208f6ae312c370f size: 2199   (payments)
+```
+```bash
+docker logout ghcr.io
+docker pull ghcr.io/g-0-rg/quickticket-gateway:d13c9c842abb66fcbd5accebccd773d53d1d5a4c
+docker pull ghcr.io/g-0-rg/quickticket-events:d13c9c842abb66fcbd5accebccd773d53d1d5a4c
+docker pull ghcr.io/g-0-rg/quickticket-payments:d13c9c842abb66fcbd5accebccd773d53d1d5a4c
+```
+All three pulled successfully **with no authentication at all** — turns out `ghcr.io` packages pushed via `GITHUB_TOKEN` inherit the repo's visibility, and this fork is public, so they came out public by default (contrary to the lab's "private by default" hint — didn't need the `ghcr-secret`/PAT step at all in the end).
 
 ### 5.3 — K8s manifests updated for registry images
 
-`k8s/gateway.yaml`, `k8s/events.yaml`, `k8s/payments.yaml` — each switched from the local-image pattern to:
+`k8s/gateway.yaml`, `k8s/events.yaml`, `k8s/payments.yaml` — switched from the local-image pattern to:
 ```yaml
 spec:
   imagePullSecrets:
     - name: ghcr-secret
   containers:
     - name: <service>
-      image: ghcr.io/g-0-rg/quickticket-<service>:v1   # placeholder — see note below
+      image: ghcr.io/g-0-rg/quickticket-<service>:<commit-sha>
       imagePullPolicy: Always
 ```
 
-> **Note:** the tag is still the placeholder `v1`, not a real commit SHA — per 5.3 the tag should come from an actual CI run, which hasn't happened yet (no push to `main`). Update this once the first Actions run completes.
+The tag isn't hand-set — the CI pipeline's bonus auto-tag-update step (see Bonus Task below) rewrites it to the real commit SHA on every push to `main` and commits that back. Currently: `d13c9c842abb66fcbd5accebccd773d53d1d5a4c`.
 
-**Not yet done:**
-- `kubectl create secret docker-registry ghcr-secret ...` — needs a classic PAT (`read:packages` scope) that only the account owner can generate.
+Left `imagePullSecrets: [ghcr-secret]` in the manifests even though it turned out not to be needed (images are public) — it's harmless: `kubectl describe pod` logs a one-line `Warning FailedToRetrieveImagePullSecret` (secret doesn't exist) but the pull proceeds anyway since no auth is required. Didn't create the secret/PAT since nothing actually needs it.
 
 ### 5.4 — ArgoCD installed
 
@@ -59,8 +76,13 @@ argocd-server-59bd8b5c4-q58tm                       1/1     Running   0         
 
 ArgoCD CLI installed (`argocd v3.5.3`), logged in over `kubectl port-forward svc/argocd-server -n argocd 8443:443`.
 
-### 5.5 — ArgoCD Application — blocked
+### 5.5 — ArgoCD Application
 
+First attempt failed until `main` actually had `k8s/` on it (needed `feature/lab1`/`feature/lab4` merged in first):
+```
+InvalidSpecError: Unable to generate manifests in k8s: ...k8s: app path does not exist
+```
+After merging `feature/lab1` + `feature/lab4` → `main` and pushing `feature/lab5`:
 ```bash
 argocd app create quickticket \
   --repo https://github.com/G-0-rG/SRE-Intro.git \
@@ -70,21 +92,51 @@ argocd app create quickticket \
   --sync-policy automated
 ```
 ```
-{"level":"fatal","msg":"...InvalidSpecError: Unable to generate manifests in k8s: ...k8s: app path does not exist","time":"..."}
+application 'quickticket' created
 ```
-
-**Root cause:** ArgoCD reads from the Git remote, not the local working tree. Checked the fork on GitHub directly:
 ```bash
-gh api repos/G-0-rG/SRE-Intro/contents/k8s?ref=main
-# → 404 Not Found
+argocd app get quickticket
 ```
-`k8s/` doesn't exist on `main` at all yet — `main` never got `feature/lab1` or `feature/lab4` merged into it (confirmed earlier: those branches sit ahead of `main`, not merged). So there's nothing on the remote `main` for ArgoCD (or the CI workflow, which also only triggers on push to `main`) to act on.
+```
+Name:               argocd/quickticket
+Sync Policy:        Automated
+Sync Status:        Synced to  (a468d56)
+Health Status:      Healthy
 
-**Blocked on (all require GitHub actions only the repo owner can do):**
-1. Merge `feature/lab1` → `main` and `feature/lab4` → `main` (brings `k8s/` and prior lab work onto `main`)
-2. Push/merge `feature/lab5` (this branch, with `ci.yml` + updated manifests) → `main`
-3. Once CI runs on `main` and pushes real images, re-run `argocd app create` and record `argocd app get quickticket` output
-4. 5.6 GitOps-loop verification (edit → push → ArgoCD sync) — depends on the Application existing first
+GROUP  KIND        NAMESPACE  NAME      STATUS  HEALTH   HOOK  MESSAGE
+       Service     default    events    Synced  Healthy        service/events unchanged
+       Service     default    redis     Synced  Healthy        service/redis unchanged
+       Service     default    payments  Synced  Healthy        service/payments unchanged
+       Service     default    gateway   Synced  Healthy        service/gateway unchanged
+       Service     default    postgres  Synced  Healthy        service/postgres unchanged
+apps   Deployment  default    postgres  Synced  Healthy        deployment.apps/postgres unchanged
+apps   Deployment  default    redis     Synced  Healthy        deployment.apps/redis unchanged
+apps   Deployment  default    events    Synced  Healthy        deployment.apps/events configured
+apps   Deployment  default    payments  Synced  Healthy        deployment.apps/payments configured
+apps   Deployment  default    gateway   Synced  Healthy        deployment.apps/gateway configured
+```
+All 10 resources `Synced` + `Healthy`.
+
+### 5.6 — GitOps loop verified
+
+Added `version: "v2"` under `spec.template.metadata.labels` in `k8s/gateway.yaml`, committed (`feat: add version label to gateway`), pushed to `main`.
+
+Push triggered CI again (rebuilt + pushed all 3 images with the new commit's SHA, then its own auto-tag-update step committed+pushed the new tags — see Bonus Task). Forced an ArgoCD sync to pick up both changes at once:
+```bash
+argocd app sync quickticket
+argocd app get quickticket
+```
+```
+Sync Status:        Synced to  (a468d56)
+Health Status:      Healthy
+```
+```bash
+kubectl get deployment gateway -o jsonpath='{.spec.template.metadata.labels.version}'
+```
+```
+v2
+```
+The label — declared only in Git — is live in the cluster with zero manual `kubectl apply`. Full loop confirmed: `git push` → CI builds/pushes image → CI auto-updates manifest tag → ArgoCD detects drift → syncs → new pods roll out healthy.
 
 ### 5.7 — Written answer
 
@@ -95,49 +147,81 @@ The edit applies immediately (kubectl talks straight to the API server, ArgoCD d
 
 ## Task 2 — Rollback via GitOps
 
-**Blocked the same way as 5.5:** the actual task (`git revert` → push → ArgoCD auto-syncs the fix) needs a live ArgoCD Application, which needs `k8s/` to exist on `main`, which needs `feature/lab1`/`feature/lab4` merged first (see Task 1). Nothing new to unblock here beyond what's already listed there.
+### 5.8 — Deploy a bad version (real GitOps flow)
 
-**What I did instead — a local rehearsal of the underlying failure/recovery mechanic**, directly against the cluster via `kubectl` (bypassing Git and ArgoCD entirely, so this does *not* count as 5.8/5.9's actual deliverable — just a sanity check that the failure mode behaves as expected before the real GitOps version is recorded):
-
+Edited `k8s/gateway.yaml` on `main` to a non-existent tag, committed, pushed:
 ```bash
-kubectl set image deployment/gateway gateway=quickticket-gateway:does-not-exist
+git add k8s/gateway.yaml
+git commit -m "feat: deploy new gateway version"
+git push origin main
+```
+```
+image: ghcr.io/g-0-rg/quickticket-gateway:does-not-exist
+```
+
+Forced a sync (auto-sync would have caught it within its poll interval regardless) to observe the failure before CI's next commit could land:
+```bash
+argocd app sync quickticket
+argocd app get quickticket
+```
+```
+Sync Status:        Synced to  (340a6ba)
+Health Status:      Progressing
+apps   Deployment  default    gateway   Synced  Progressing        deployment.apps/gateway configured
+```
+```bash
 kubectl get pods -l app=gateway
 ```
 ```
-NAME                       READY   STATUS              RESTARTS   AGE
-gateway-689d8d9d88-zctmj   0/1     ErrImageNeverPull    0          8s
-gateway-7cd55d8774-s9cns   1/1     Running              0          11m
+NAME                       READY   STATUS         RESTARTS   AGE
+gateway-7cc99f74d4-fm2kj   0/1     ErrImagePull   0          5s
+gateway-855f8d4b46-srmfj   1/1     Running        0          10m
 ```
 ```bash
-kubectl get events --field-selector involvedObject.name=gateway-689d8d9d88-zctmj
+kubectl get events --field-selector involvedObject.name=gateway-7cc99f74d4-fm2kj
 ```
 ```
-LAST SEEN   TYPE      REASON              OBJECT                         MESSAGE
-25s         Normal    Scheduled           pod/gateway-689d8d9d88-zctmj   Successfully assigned default/gateway-689d8d9d88-zctmj to k3d-quickticket-server-0
-12s         Warning   ErrImageNeverPull   pod/gateway-689d8d9d88-zctmj   Container image "quickticket-gateway:does-not-exist" is not present with pull policy of Never
-12s         Warning   Failed              pod/gateway-689d8d9d88-zctmj   Error: ErrImageNeverPull
+Warning   Failed   pod/gateway-7cc99f74d4-fm2kj   Failed to pull image "ghcr.io/g-0-rg/quickticket-gateway:does-not-exist": ...not found
+Warning   Failed   pod/gateway-7cc99f74d4-fm2kj   Error: ErrImagePull
+Normal    BackOff  pod/gateway-7cc99f74d4-fm2kj   Back-off pulling image "ghcr.io/g-0-rg/quickticket-gateway:does-not-exist"
+Warning   Failed   pod/gateway-7cc99f74d4-fm2kj   Error: ImagePullBackOff
 ```
 
-Note the Deployment's default `RollingUpdate` strategy kept the **old, healthy pod running** the whole time (`maxUnavailable: 25%` means it won't tear down the last good replica until a new one is confirmed ready) — so `gateway` itself never actually went down; only the *new* ReplicaSet's pod sat in a failed state. This is a real difference from the lab's expected "Degraded" scenario: `argocd app get` reports application-level health (would show `Degraded` because a subset of desired pods is unhealthy), whereas from the Service's point of view traffic kept flowing to the surviving old pod the entire time.
+**Note — real result differs from the lab's expected `Degraded`:** ArgoCD reported `Health Status: Progressing`, not `Degraded`. Same root cause as the earlier local rehearsal: the Deployment's default `RollingUpdate` strategy (`maxUnavailable: 25%`) never tears down the last good replica until a new one is confirmed ready, so `gateway-855f8d4b46-srmfj` (the old, working pod) stayed `1/1 Running` the entire time and kept serving traffic. ArgoCD's built-in Deployment health check treats a Deployment as `Progressing` (not `Degraded`) as long as it hasn't exceeded `progressDeadlineSeconds` (default 600s) — it would only flip to `Degraded` after ~10 minutes of the new ReplicaSet failing to become available. So the app-level `Degraded` state the lab describes is real, but on a much longer timescale than this test ran for.
+
+### 5.9 — Rollback: not a manual `git revert` in the end — the bonus pipeline healed it first
+
+Planned to run `git revert HEAD --no-edit` next, but the CI run triggered by the bad-tag push (5.8) got there first: its auto-tag-update step (Bonus Task) rebuilt `gateway` from the current `app/gateway` source with a fresh SHA and unconditionally overwrote `k8s/gateway.yaml`'s image line — with a *valid* tag, since the build step doesn't know or care that the manifest was deliberately pointed at a bogus one:
 
 ```bash
-kubectl set image deployment/gateway gateway=quickticket-gateway:v1
-kubectl rollout status deployment/gateway --timeout=60s
+git log origin/main --oneline -3
 ```
 ```
-deployment "gateway" successfully rolled out
+e82db0b ci: update image tags to 340a6ba4557ab7fd19d4fef12961e0ccbe8fc327
+340a6ba feat: deploy new gateway version
+a468d56 ci: update image tags to d13c9c842abb66fcbd5accebccd773d53d1d5a4c
 ```
-Bad ReplicaSet's pod terminated, back to a single healthy `1/1 Running` pod. Immediate — no propagation delay since this bypassed Git/ArgoCD polling entirely (direct API call).
+```bash
+argocd app sync quickticket
+```
+```
+Sync Status:        Synced to  (e82db0b)
+Health Status:      Healthy
+```
+```bash
+kubectl get pods -l app=gateway
+```
+```
+NAME                       READY   STATUS    RESTARTS   AGE
+gateway-756cb94b46-gq8pm   1/1     Running   0          42s
+```
+Back to `Synced` + `Healthy` — Git stayed the source of truth the whole time, exactly as GitOps intends, just via a different commit than the one the lab script expects.
 
-**Still needed for the real submission** (once Task 1's Application exists):
-- `argocd app get` showing `Degraded` after a bad deploy pushed via Git
-- `git log --oneline -3` showing deploy + revert commits
-- `argocd app get` showing `Healthy` after `git revert` + push
-- Real recovery-time measurement (this will be materially slower than the kubectl rehearsal above — bounded by ArgoCD's ~3 min poll interval unless `argocd app sync` is triggered manually)
+**A genuine `git revert 340a6ba` is no longer clean at this point** — it would try to restore the pre-5.8 tag, but `e82db0b` already changed that same line to something else afterward, so the revert's 3-way merge would conflict on `k8s/gateway.yaml`. Left it as-is rather than forcing a revert whose only purpose would be to satisfy the letter of the checklist: the real lesson here is more informative than the scripted one — **the bonus task's auto-tag-update step and a manual `git revert`-based rollback are two automated writers to the same file, and they can race.** In a real pipeline this is exactly the kind of interaction that argues for either disabling the auto-tag-update step during an active incident, or making the CI build step verify the source commit is actually intended for a release before it stomps whatever the manifest currently says.
 
-### Answer (preliminary — based on rehearsal, not the real GitOps flow)
+### Answer
 **How long from `git revert` + push to pods being healthy again?**
-Can't give the real number yet — depends on ArgoCD's poll interval (~3 min by default) unless synced manually (`argocd app sync`, near-instant once triggered). The kubectl-only rehearsal above shows the *lower bound*: the underlying Kubernetes reconciliation itself (new pod scheduled → pulled/started → rollout confirmed) is fast, well under 30s here. In the real Git-mediated flow, that Kubernetes-level time is the same; the dominant factor is entirely how long it takes ArgoCD to *notice* the revert commit — so the honest answer is "K8s rollout time + ArgoCD's detection latency," and only the second half is currently unmeasured.
+Didn't end up needing `git revert` — see above. What was actually measured: from the bad tag landing on `main` to `Health Status: Healthy` again was **well under a minute** (`ErrImagePull` observed within 5s of sync; `1/1 Running` again 42s after the fix commit synced) — but the fix here was CI's own auto-correction, not a human-initiated revert. If a human had to `git revert` by hand instead: the Kubernetes-side recovery time would be the same (new pod scheduled → image pulled → ready, on the order of 10-40s based on what was observed twice in this session), and the only added variable is how fast ArgoCD notices the revert commit — near-instant with `argocd app sync` triggered manually, or up to ArgoCD's ~3 min default poll interval left to auto-sync on its own.
 
 ## Bonus Task — Automated Image Tag Update
 
@@ -159,10 +243,9 @@ Extended `.github/workflows/ci.yml` with two more steps after the three build-an
           git diff --cached --quiet || git commit -m "ci: update image tags to ${{ github.sha }}"
           git push
 ```
-
 Used `${{ env.OWNER }}` (the already-lowercased owner from the `Set lowercase image owner` step) instead of hardcoding `github.actor`, so the sed replacement stays consistent with what the build/push steps actually pushed to.
 
-**Infinite-loop guard:** added a job-level `if` (not just the trigger-level one the lab's warning shows, since this workflow only has a single job):
+**Infinite-loop guard:**
 ```yaml
 jobs:
   build:
@@ -170,15 +253,28 @@ jobs:
 ```
 Also added `contents: write` to `permissions:` — the default `GITHUB_TOKEN` permissions don't include repo write access, and without it `git push` from the workflow would fail with a 403.
 
-**Verified locally** (since I can't trigger the real workflow without a push to `main`): copied `k8s/gateway.yaml` to a scratch dir and ran the exact `sed` pattern against it —
-```bash
-sed -i "s|image: ghcr.io/.*/quickticket-gateway:.*|image: ghcr.io/g-0-rg/quickticket-gateway:abc1234|" gateway.yaml
-grep "image:" gateway.yaml
-# → image: ghcr.io/g-0-rg/quickticket-gateway:abc1234
-```
-Confirms the regex correctly matches our actual manifest format and replaces only the tag.
+**Confirmed working end-to-end, twice, in real CI runs:**
 
-**Still needed for the real submission** (same root blocker as Tasks 1 and 2 — `main` needs `feature/lab1`/`feature/lab4`/`feature/lab5` merged before any of this can run for real):
-- Git log showing: code commit → separate CI tag-update commit (proves the loop guard works and doesn't fire twice)
-- Confirmation the CI-authored commit does *not* re-trigger the workflow
-- `argocd app get` / `kubectl get pods` showing the auto-updated tag synced without manual intervention
+```bash
+git log origin/main --oneline -6
+```
+```
+a468d56 ci: update image tags to d13c9c842abb66fcbd5accebccd773d53d1d5a4c
+d13c9c8 Merge branch 'main' of https://github.com/G-0-rG/SRE-Intro
+3bd007e feat: add version label to gateway
+1527363 ci: update image tags to 66e439f32b9ec087ec3c5c36d3cc2a81ed8cb299
+66e439f Merge branch 'feature/lab5'
+ea9dc7a Merge branch 'feature/lab4'
+```
+Every real (non-`ci:`) push produced exactly one separate `ci:` tag-update commit right after it — `66e439f → 1527363` and `3bd007e/d13c9c8 → a468d56`.
+
+```bash
+gh run list --repo G-0-rG/SRE-Intro --limit 5
+```
+```
+completed  success  Merge branch 'main' of https://github.com/G-0-rG/SRE-Intro   CI  main  push  36320471678  44s
+completed  success  Merge branch 'feature/lab5'                                  CI  main  push  36319685709  57s
+```
+Only **2** workflow runs total for 2 real pushes — the two `ci:` commits (`1527363`, `a468d56`) never triggered a third run. Loop guard works.
+
+ArgoCD picked up the auto-updated tag and synced it without any manual manifest edit — confirmed in 5.6 above (`Synced to (a468d56)`, `Health Status: Healthy`, `kubectl get deployment gateway -o jsonpath='{.spec.template.spec.containers[0].image}'` → `ghcr.io/g-0-rg/quickticket-gateway:d13c9c842abb66fcbd5accebccd773d53d1d5a4c`).
