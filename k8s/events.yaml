@@ -3,7 +3,7 @@ kind: Deployment
 metadata:
   name: events
 spec:
-  replicas: 1
+  replicas: 2
   selector:
     matchLabels:
       app: events
@@ -12,14 +12,19 @@ spec:
       labels:
         app: events
     spec:
-      imagePullSecrets:
-        - name: ghcr-secret
+      terminationGracePeriodSeconds: 40
       containers:
         - name: events
-          image: ghcr.io/g-0-rg/quickticket-events:340a6ba4557ab7fd19d4fef12961e0ccbe8fc327
-          imagePullPolicy: Always
+          image: quickticket-events:lab12-b
+          imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8081
+          lifecycle:
+            # Same reason as gateway: keep serving while the pod is removed from
+            # Service endpoints (12.2: killing an events pod gave ConnectError 502s).
+            preStop:
+              exec:
+                command: ["sh", "-c", "sleep 10"]
           env:
             - name: DB_HOST
               value: "postgres"
@@ -41,16 +46,20 @@ spec:
               value: "1000"
             - name: RESERVATION_TTL
               value: "300"
+          # Liveness = "is this process alive?" only. /metrics has no downstream
+          # dependencies; restarting a pod can't fix a missing dependency (Lab 8, Exp 3).
           livenessProbe:
             httpGet:
-              path: /health
+              path: /metrics
               port: 8081
             initialDelaySeconds: 10
             periodSeconds: 10
             failureThreshold: 3
+          # Readiness checks Postgres (which every events path needs) but not Redis,
+          # so a Redis outage breaks only reservations instead of the whole service.
           readinessProbe:
             httpGet:
-              path: /health
+              path: /events
               port: 8081
             periodSeconds: 5
             failureThreshold: 2
